@@ -1,0 +1,114 @@
+# Build-only Windows CUDA zips of the bonsai2 branch for the bonsai2-small-gpu hub repo.
+# Runs on push to bonsai2-windows. Uploads workflow artifacts only, never a GitHub release.
+name: bonsai2 windows cuda
+
+on:
+  push:
+    branches: [bonsai2-windows]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bonsai2-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SRC_COMMIT: ff41412
+
+jobs:
+  windows-cuda:
+    runs-on: windows-2022
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: '12.4'
+            archs: '86;89'
+            tag: 'sm86-sm89'
+          - cuda: '13.3'
+            archs: '120'
+            tag: 'sm120'
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Code is the v1.1 commit, only this workflow added
+        shell: bash
+        run: |
+          git diff --stat "$SRC_COMMIT" HEAD
+          test -z "$(git diff --name-only "$SRC_COMMIT" HEAD -- . ':(exclude).github/workflows/bonsai2-windows.yml')"
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          rem BACKEND_DL + CPU_ALL_VARIANTS like release-prism.yml, so CPUs without AVX2 still start (#241)
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_FA=ON ^
+            -DGGML_CUDA_GRAPHS=ON ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.archs }}" ^
+            -DLLAMA_CURL=OFF ^
+            -DLLAMA_OPENSSL=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DCMAKE_CUDA_FLAGS="-diag-suppress=221"
+          if errorlevel 1 exit /b 1
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          $name = "bonsai2-small-gpu-windows-x64-cuda${{ matrix.cuda }}-${{ matrix.tag }}-$env:SRC_COMMIT"
+          $dst = "pack\$name"
+          New-Item -ItemType Directory -Force "$dst\bin" | Out-Null
+          Copy-Item build\bin\Release\*.dll "$dst\bin\"
+          foreach ($exe in 'llama-server.exe', 'llama-cli.exe', 'llama-bench.exe') { Copy-Item "build\bin\Release\$exe" "$dst\bin\" }
+          foreach ($d in "$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\lib") {
+            if (Test-Path $d) { Get-ChildItem "$d\*" -Include cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll -File | Copy-Item -Destination "$dst\bin\" }
+          }
+          Copy-Item LICENSE "$dst\LICENSE-llama.cpp"
+          Get-ChildItem "$dst\bin" | Sort-Object Name | Format-Table Name, Length -AutoSize
+          7z a -tzip "pack\$name.zip" ".\$dst" | Out-Null
+          $h = (Get-FileHash "pack\$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$h  $name.zip" | Out-File "pack\$name.zip.sha256" -Encoding ascii
+          "PKG=$name" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Smoke test (this runner has no GPU)
+        shell: pwsh
+        run: |
+          $bin = "pack\$env:PKG\bin"
+          foreach ($f in 'ggml-cuda.dll', 'llama-server.exe') { if (-not (Test-Path "$bin\$f")) { throw "$f missing" } }
+          if (-not (Get-ChildItem "$bin\cudart64_*.dll")) { throw "cudart missing" }
+          & "$bin\llama-server.exe" --version; if ($LASTEXITCODE -ne 0) { throw "llama-server --version failed" }
+          & "$bin\llama-cli.exe" --version; if ($LASTEXITCODE -ne 0) { throw "llama-cli --version failed" }
+          & "$bin\llama-server.exe" --list-devices
+          & "$bin\llama-server.exe" --help | Select-String -Pattern 'spec-type|draft-mtp|--fit' | Select-Object -First 5
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.PKG }}
+          path: |
+            pack/${{ env.PKG }}.zip
+            pack/${{ env.PKG }}.zip.sha256
+          retention-days: 30
