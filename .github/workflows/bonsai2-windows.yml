@@ -44,6 +44,13 @@ jobs:
           git diff --stat "$SRC_COMMIT" HEAD
           test -z "$(git diff --name-only "$SRC_COMMIT" HEAD -- . ':(exclude).github/workflows/bonsai2-windows.yml')"
 
+      - name: Install ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: bonsai2-windows-cuda-${{ matrix.cuda }}
+          variant: ccache
+          evict-old-files: 1d
+
       - name: Install Cuda Toolkit
         uses: ./.github/actions/windows-setup-cuda
         with:
@@ -86,6 +93,11 @@ jobs:
           foreach ($d in "$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\lib") {
             if (Test-Path $d) { Get-ChildItem "$d\*" -Include cudart64_*.dll, cublas64_*.dll, cublasLt64_*.dll -File | Copy-Item -Destination "$dst\bin\" }
           }
+          # app-local MSVC runtime (CRT + OpenMP), so a fresh Windows without the VC++ redistributable still starts
+          $redist = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT" -Directory | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $redist) { throw "MSVC redist folder not found" }
+          Copy-Item "$($redist.FullName)\*.dll" "$dst\bin\"
+          Copy-Item "$(Split-Path $redist.FullName)\Microsoft.VC143.OpenMP\vcomp140.dll" "$dst\bin\"
           Copy-Item LICENSE "$dst\LICENSE-llama.cpp"
           Get-ChildItem "$dst\bin" | Sort-Object Name | Format-Table Name, Length -AutoSize
           7z a -tzip "pack\$name.zip" ".\$dst" | Out-Null
@@ -99,6 +111,19 @@ jobs:
           $bin = "pack\$env:PKG\bin"
           foreach ($f in 'ggml-cuda.dll', 'llama-server.exe') { if (-not (Test-Path "$bin\$f")) { throw "$f missing" } }
           if (-not (Get-ChildItem "$bin\cudart64_*.dll")) { throw "cudart missing" }
+          # every DLL import of every shipped binary must be in bin\ or in Windows itself; nvcuda.dll comes with the NVIDIA driver
+          $dumpbin = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $missing = @()
+          foreach ($f in Get-ChildItem "$bin\*" -Include *.exe, *.dll) {
+            foreach ($l in (& $dumpbin.FullName /dependents $f.FullName)) {
+              if ($l -match '^\s+(\S+\.dll)\s*$') {
+                $d = $Matches[1]
+                if ($d -match '^(api-ms-win-|ext-ms-)' -or $d -ieq 'nvcuda.dll') { continue }
+                if (-not (Test-Path "$bin\$d") -and -not (Test-Path "$env:SystemRoot\System32\$d")) { $missing += "$($f.Name) -> $d" }
+              }
+            }
+          }
+          if ($missing) { $missing | ForEach-Object { Write-Host "MISSING $_" }; throw "unresolved DLL imports" } else { Write-Host "all DLL imports resolve inside bin\ or Windows" }
           & "$bin\llama-server.exe" --version; if ($LASTEXITCODE -ne 0) { throw "llama-server --version failed" }
           & "$bin\llama-cli.exe" --version; if ($LASTEXITCODE -ne 0) { throw "llama-cli --version failed" }
           & "$bin\llama-server.exe" --list-devices
