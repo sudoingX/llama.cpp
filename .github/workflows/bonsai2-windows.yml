@@ -31,6 +31,9 @@ jobs:
           - cuda: '13.3'
             archs: '120'
             tag: 'sm120'
+          - cuda: '12.4'
+            archs: '75'
+            tag: 'sm75'
 
     steps:
       - name: Clone
